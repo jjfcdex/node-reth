@@ -34,6 +34,8 @@ use tokio::{
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 use tracing::{debug, trace, warn};
 
+use reth_rpc_eth_types::{CallXArgs,LogOrRevert};
+
 use crate::{metrics::Metrics, pending_blocks::PendingBlocks};
 
 /// Max configured timeout for `eth_sendRawTransactionSync` in milliseconds.
@@ -121,6 +123,16 @@ pub trait EthApiOverride {
         state_overrides: Option<StateOverride>,
         block_overrides: Option<Box<BlockOverrides>>,
     ) -> RpcResult<alloy_primitives::Bytes>;
+
+    #[method(name = "callX")]
+    async fn call_x(
+        &self,
+        transaction: OpTransactionRequest,
+        block_number: Option<BlockId>,
+        state_overrides: Option<StateOverride>,
+        block_overrides: Option<Box<BlockOverrides>>,
+        call_args:Option<CallXArgs>,
+    ) -> RpcResult<LogOrRevert>;
 
     #[method(name = "estimateGas")]
     async fn estimate_gas(
@@ -334,6 +346,54 @@ where
                 }
             }
         }
+    }
+
+    async fn call_x(
+        &self,
+        transaction: OpTransactionRequest,
+        block_number: Option<BlockId>,
+        state_overrides: Option<StateOverride>,
+        block_overrides: Option<Box<BlockOverrides>>,
+        call_args:Option<CallXArgs>,
+    ) -> RpcResult<LogOrRevert> {
+        debug!(
+            message = "rpc::callX",
+            transaction = ?transaction,
+            block_number = ?block_number,
+            state_overrides = ?state_overrides,
+            block_overrides = ?block_overrides,
+            call_args = ?call_args,
+        );
+
+        let mut block_id = block_number.unwrap_or_default();
+        let mut pending_overrides = EvmOverrides::default();
+        // If the call is to pending block use cached override (if they exist)
+        let mut flashblock_index= None;
+        if block_id.is_pending() {
+            self.metrics.call.increment(1);
+            let pending_blocks = self.flashblocks_state.get_pending_blocks();
+            block_id = pending_blocks.get_canonical_block_number().into();
+            pending_overrides.state = pending_blocks.get_state_overrides();
+            flashblock_index = pending_blocks.as_ref().map(|pb| pb.latest_flashblock_index());
+        }
+
+        // Apply user's overrides on top
+        let mut state_overrides_builder =
+            StateOverridesBuilder::new(pending_overrides.state.unwrap_or_default());
+        state_overrides_builder =
+            state_overrides_builder.extend(state_overrides.unwrap_or_default());
+        let final_overrides = state_overrides_builder.build();
+
+        // Delegate to the underlying eth_api
+        let mut result:LogOrRevert = EthCall::call_x(
+            &self.eth_api,
+            transaction,
+            Some(block_id),
+            EvmOverrides::new(Some(final_overrides), block_overrides),
+            call_args,
+        ).await.map_err(Into::into)?;
+        result.flashblock_index = flashblock_index;
+        Ok(result)
     }
 
     async fn call(
