@@ -369,12 +369,15 @@ where
         let mut pending_overrides = EvmOverrides::default();
         // If the call is to pending block use cached override (if they exist)
         let mut flashblock_index= None;
+        let start_pending = std::time::Instant::now();
         if block_id.is_pending() {
             self.metrics.call.increment(1);
             let pending_blocks = self.flashblocks_state.get_pending_blocks();
             block_id = pending_blocks.get_canonical_block_number().into();
             pending_overrides.state = pending_blocks.get_state_overrides();
             flashblock_index = pending_blocks.as_ref().map(|pb| pb.latest_flashblock_index());
+            let elapsed_pending = start_pending.elapsed();
+            debug!(message = "call_x pending block handling duration", duration_ms = elapsed_pending.as_millis());
         }
 
         // Apply user's overrides on top
@@ -383,6 +386,8 @@ where
         state_overrides_builder =
             state_overrides_builder.extend(state_overrides.unwrap_or_default());
         let final_overrides = state_overrides_builder.build();
+        let elapsed_overrides = start_pending.elapsed();
+        debug!(message = "call_x state overrides build duration", duration_ms = elapsed_overrides.as_millis());
 
         // Delegate to the underlying eth_api
         let mut result:LogOrRevert = EthCall::call_x(
@@ -393,6 +398,8 @@ where
             call_args,
         ).await.map_err(Into::into)?;
         result.flashblock_index = flashblock_index;
+        let elapsed_after_result = start_pending.elapsed();
+        debug!(message = "call_x after setting EthCall::call_x duration", duration_ms = elapsed_after_result.as_millis());
         Ok(result)
     }
 
@@ -414,11 +421,14 @@ where
         let mut block_id = block_number.unwrap_or_default();
         let mut pending_overrides = EvmOverrides::default();
         // If the call is to pending block use cached override (if they exist)
+        let start_pending = std::time::Instant::now();
         if block_id.is_pending() {
             self.metrics.call.increment(1);
             let pending_blocks = self.flashblocks_state.get_pending_blocks();
             block_id = pending_blocks.get_canonical_block_number().into();
             pending_overrides.state = pending_blocks.get_state_overrides();
+            let elapsed_pending = start_pending.elapsed();
+            debug!(message = "call pending block handling duration", duration_ms = elapsed_pending.as_millis());
         }
 
         // Apply user's overrides on top
@@ -427,16 +437,21 @@ where
         state_overrides_builder =
             state_overrides_builder.extend(state_overrides.unwrap_or_default());
         let final_overrides = state_overrides_builder.build();
-
+        let elapsed_overrides = start_pending.elapsed();
+        debug!(message = "call state overrides build duration", duration_ms = elapsed_overrides.as_millis());
         // Delegate to the underlying eth_api
-        EthCall::call(
+        let result = EthCall::call(
             &self.eth_api,
             transaction,
             Some(block_id),
             EvmOverrides::new(Some(final_overrides), block_overrides),
         )
         .await
-        .map_err(Into::into)
+        .map_err(Into::into);
+        let elapsed_after_result = start_pending.elapsed();
+        debug!(message = "call after setting EthCall::call duration", duration_ms = elapsed_after_result.as_millis());
+
+        result
     }
 
     async fn estimate_gas(
