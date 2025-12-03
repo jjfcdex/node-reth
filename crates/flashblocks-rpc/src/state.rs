@@ -318,6 +318,12 @@ where
                     // or the first flashblock for the next block
                     let mut flashblocks = pending_blocks.get_flashblocks();
                     flashblocks.push(flashblock);
+
+                    debug!(message = "process_flashblock process next flash block",
+                        flashblocks = flashblocks.len(),
+                        from = flashblocks.first().unwrap().metadata.block_number,
+                        to = flashblocks.last().unwrap().metadata.block_number,
+                    );
                     self.build_pending_state(prev_pending_blocks, &flashblocks)
                 } else if pending_blocks.latest_block_number() != flashblock.metadata.block_number {
                     // We have received a non-zero flashblock for a new block
@@ -352,6 +358,7 @@ where
             }
             None => {
                 if flashblock.index == 0 {
+                    debug!(message = "process_flashblock process new block", flashblocks = 1);
                     self.build_pending_state(None, &vec![flashblock])
                 } else {
                     info!(message = "waiting for first Flashblock");

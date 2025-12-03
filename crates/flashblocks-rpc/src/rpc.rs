@@ -377,7 +377,27 @@ where
             pending_overrides.state = pending_blocks.get_state_overrides();
             flashblock_index = pending_blocks.as_ref().map(|pb| pb.latest_flashblock_index());
             let elapsed_pending = start_pending.elapsed();
-            debug!(message = "call_x pending block handling duration", duration_ms = elapsed_pending.as_millis());
+            
+            // 统计state overrides中有多少account，有多少state，有多少state_diff, 有多少storage slots
+            let mut acc_num = 0;
+            let mut state_num = 0;
+            let mut state_diff_num = 0;
+            match pending_overrides.state.as_ref() {
+                Some(state) => {
+                    acc_num = state.len();
+                    for v in state.values() {
+                        state_num += v.state.as_ref().map(|s| s.len()).unwrap_or(0);
+                        state_diff_num += v.state_diff.as_ref().map(|s| s.len()).unwrap_or(0);
+                    }
+                }
+                None => {}
+            }
+            
+            debug!(message = "call_x pending block handling duration",
+                acc_num = acc_num,
+                state_num = state_num,
+                state_diff_num = state_diff_num,
+                duration_ms = elapsed_pending.as_millis());
         }
 
         // Apply user's overrides on top
