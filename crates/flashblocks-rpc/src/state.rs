@@ -3,7 +3,7 @@ use std::{
     sync::Arc,
     time::Instant,
 };
-
+use std::sync::Mutex as StdMutex;
 use alloy_consensus::{
     transaction::{Recovered, SignerRecoverable, TransactionMeta},
     Header, TxReceipt,
@@ -183,6 +183,7 @@ struct StateProcessor<Client> {
     metrics: Metrics,
     client: Client,
     sender: Sender<Arc<PendingBlocks>>,
+    waiting_flashblocks: Arc<StdMutex<Option<Vec<Flashblock>>>>,
 }
 
 impl<Client> StateProcessor<Client>
@@ -199,7 +200,8 @@ where
         rx: Arc<Mutex<UnboundedReceiver<StateUpdate>>>,
         sender: Sender<Arc<PendingBlocks>>,
     ) -> Self {
-        Self { metrics: Metrics::default(), pending_blocks, client, rx, sender }
+        let waiting_flashblocks = Arc::new(StdMutex::new(None));
+        Self { metrics: Metrics::default(), pending_blocks, client, rx, sender, waiting_flashblocks }
     }
 
     async fn start(&self) {
@@ -311,8 +313,28 @@ where
                 }
             }
             None => {
-                debug!(message = "no pending state to update with canonical block, skipping");
-                Ok(None)
+                // Work with waiting_flashblocks under lock; avoid panics on empty/missing
+                let op_block_number = block.number;
+                let mut guard = self.waiting_flashblocks.lock().unwrap();
+                let Some(vec) = guard.as_mut() else {
+                    return Ok(None);
+                };
+                if vec.is_empty() {
+                    // nothing buffered yet
+                    return Ok(None);
+                }
+                let waiting_fb_first_block_number = vec.first().map(|fb| fb.metadata.block_number).unwrap_or(op_block_number);
+                let waiting_fb_last_block_number = vec.last().map(|fb| fb.metadata.block_number).unwrap_or(op_block_number);
+                if op_block_number < waiting_fb_first_block_number.saturating_sub(1)
+                    || op_block_number >= waiting_fb_last_block_number
+                {
+                    return Ok(None);
+                }
+                vec.retain(|fb| fb.metadata.block_number > op_block_number);
+                let waiting_flashblocks = guard.take().unwrap_or_default();
+                drop(guard);
+
+                self.build_pending_state(None, &waiting_flashblocks, None)
             }
         }
     }
@@ -372,13 +394,61 @@ where
                 }
             }
             None => {
-                if flashblock.index == 0 {
-                    debug!(message = "process_flashblock process new block", flashblocks = 1);
-                    self.build_pending_state(None, &vec![flashblock], None)
-                } else {
-                    info!(message = "waiting for first Flashblock");
-                    Ok(None)
+                // Use mutex-guarded waiting buffer
+                {
+                    let mut guard = self.waiting_flashblocks.lock().unwrap();
+                    if guard.is_none() {
+                        // No buffer yet
+                        if flashblock.index == 0 {
+                            // Do not hold the lock during client IO/build
+                            drop(guard);
+                            if self
+                                .client
+                                .header_by_number(flashblock.metadata.block_number.saturating_sub(1))?
+                                .is_some()
+                            {
+                                debug!(message = "process_flashblock process new block", flashblocks = 1);
+                                return self.build_pending_state(None, &vec![flashblock], None);
+                            } else {
+                                let mut v = Vec::new();
+                                v.push(flashblock);
+                                let mut guard = self.waiting_flashblocks.lock().unwrap();
+                                *guard = Some(v);
+                                return Ok(None);
+                            }
+                        } else {
+                            info!(message = "waiting for first Flashblock");
+                            return Ok(None);
+                        }
+                    }
                 }
+
+                let mut guard = self.waiting_flashblocks.lock().unwrap();
+                if let Some(vec) = guard.as_mut() {
+                    if vec.is_empty() {
+                        *guard = None;
+                        return Ok(None);
+                    }
+                    let last_fb = vec.last().cloned();
+                    if let Some(last_fb) = last_fb {
+                        let is_next_of_block = last_fb.metadata.block_number
+                            == flashblock.metadata.block_number
+                            && last_fb.index + 1 == flashblock.index;
+                        let is_first_of_block = last_fb.metadata.block_number + 1
+                            == flashblock.metadata.block_number
+                            && flashblock.index == 0;
+                        if is_next_of_block || is_first_of_block {
+                            vec.push(flashblock);
+                            // 仅仅保留两个区块的数据
+                            vec.retain(|fb| fb.metadata.block_number >= last_fb.metadata.block_number - 1);
+                        } else {
+                            warn!(message = "received non-sequential Flashblock, ignoring", last_fb_index = last_fb.index, new_fb_index = flashblock.index);
+                            *guard = None;
+                            return Ok(None);
+                        }
+                    }
+                }
+                Ok(None)
             }
         }
     }
