@@ -26,6 +26,7 @@ use reth::{
         DatabaseCommit, State,
     },
 };
+use reth::revm::state::EvmState;
 use reth_evm::{ConfigureEvm, Evm};
 use reth_optimism_chainspec::OpHardforks;
 use reth_optimism_evm::{OpEvmConfig, OpNextBlockEnvAttributes};
@@ -292,11 +293,21 @@ where
                         self.metrics.pending_clear_reorg.increment(1);
 
                         // If there is a reorg, we re-process all future flashblocks without reusing the existing pending state
-                        return self.build_pending_state(None, &flashblocks);
+                        // But pass along the previous transaction state cache to avoid re-executing unchanged transactions
+                        return self.build_pending_state(
+                            None,
+                            &flashblocks,
+                            None,
+                        );
                     }
-
-                    // If no reorg, we can continue building on top of the existing pending state
-                    self.build_pending_state(prev_pending_blocks, &flashblocks)
+                    
+                    // If no reorg, rebuild fresh pending state (clear previous state)
+                    // 为了加快速度，使用上次的交易缓存（prev_pending_blocks.transaction_state）
+                    self.build_pending_state(
+                        None,
+                        &flashblocks,
+                        Some(pending_blocks.transaction_state.clone()),
+                    )
                 }
             }
             None => {
@@ -324,7 +335,11 @@ where
                         from = flashblocks.first().unwrap().metadata.block_number,
                         to = flashblocks.last().unwrap().metadata.block_number,
                     );
-                    self.build_pending_state(prev_pending_blocks, &flashblocks)
+                    self.build_pending_state(
+                        prev_pending_blocks.clone(),
+                        &flashblocks,
+                        None,
+                    )
                 } else if pending_blocks.latest_block_number() != flashblock.metadata.block_number {
                     // We have received a non-zero flashblock for a new block
                     self.metrics.unexpected_block_order.increment(1);
@@ -359,7 +374,7 @@ where
             None => {
                 if flashblock.index == 0 {
                     debug!(message = "process_flashblock process new block", flashblocks = 1);
-                    self.build_pending_state(None, &vec![flashblock])
+                    self.build_pending_state(None, &vec![flashblock], None)
                 } else {
                     info!(message = "waiting for first Flashblock");
                     Ok(None)
@@ -372,6 +387,7 @@ where
         &self,
         prev_pending_blocks: Option<Arc<PendingBlocks>>,
         flashblocks: &Vec<Flashblock>,
+        prev_transaction_state: Option<HashMap<B256, EvmState>>,
     ) -> eyre::Result<Option<Arc<PendingBlocks>>> {
         // BTreeMap guarantees ascending order of keys while iterating
         let mut flashblocks_per_block = BTreeMap::<BlockNumber, Vec<&Flashblock>>::new();
@@ -575,21 +591,43 @@ where
                 gas_used = receipt.cumulative_gas_used();
                 next_log_index += receipt.logs().len();
 
-                let mut should_execute_transaction = false;
-                match &prev_pending_blocks {
-                    Some(pending_blocks) => {
-                        match pending_blocks.get_transaction_state(transaction.tx_hash()) {
-                            Some(state) => {
-                                pending_blocks_builder
-                                    .with_transaction_state(transaction.tx_hash(), state);
-                            }
-                            None => {
-                                should_execute_transaction = true;
-                            }
-                        }
+                let mut should_execute_transaction = true;
+                // 1) Prefer state from prev_pending_blocks if available
+                if let Some(prev) = &prev_pending_blocks {
+                    if let Some(state) = prev.get_transaction_state(transaction.tx_hash()) {
+                        // 如果存在prev_pending_blocks, 表示状态已经在state_overrides中存在，这个时候不需要记录state
+                        pending_blocks_builder
+                            .with_transaction_state(transaction.tx_hash(), state);
+                        should_execute_transaction = false;
                     }
-                    None => {
-                        should_execute_transaction = true;
+                }
+                // 2) If no prev_pending_blocks or no cached entry there, try prev_transaction_state cache
+                if should_execute_transaction {
+                    if let Some(cache) = &prev_transaction_state {
+                        if let Some(state) = cache.get(&transaction.tx_hash()).cloned() {
+                            // Apply state to overrides since we skip execution
+                            for (addr, acc) in &state {
+                                let existing_override =
+                                    state_overrides.entry(*addr).or_insert(Default::default());
+                                existing_override.balance = Some(acc.info.balance);
+                                existing_override.nonce = Some(acc.info.nonce);
+                                existing_override.code =
+                                    acc.info.code.clone().map(|code| code.bytes());
+
+                                let existing = existing_override
+                                    .state_diff
+                                    .get_or_insert(Default::default());
+                                let changed_slots = acc.storage.iter().map(|(&key, slot)| {
+                                    (B256::from(key), B256::from(slot.present_value))
+                                });
+
+                                existing.extend(changed_slots);
+                            }
+
+                            pending_blocks_builder
+                                .with_transaction_state(transaction.tx_hash(), state);
+                            should_execute_transaction = false;
+                        }
                     }
                 }
 

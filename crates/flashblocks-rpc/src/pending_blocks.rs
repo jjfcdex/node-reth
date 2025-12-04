@@ -138,7 +138,7 @@ pub struct PendingBlocks {
     transaction_count: HashMap<Address, U256>,
     transaction_receipts: HashMap<B256, OpTransactionReceipt>,
     transactions_by_hash: HashMap<B256, Transaction>,
-    transaction_state: HashMap<B256, EvmState>,
+    pub transaction_state: HashMap<B256, EvmState>,
     state_overrides: Option<StateOverride>,
 
     db_cache: Cache,
