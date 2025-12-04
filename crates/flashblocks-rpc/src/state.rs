@@ -3,7 +3,6 @@ use std::{
     sync::Arc,
     time::Instant,
 };
-use std::sync::Mutex as StdMutex;
 use alloy_consensus::{
     transaction::{Recovered, SignerRecoverable, TransactionMeta},
     Header, TxReceipt,
