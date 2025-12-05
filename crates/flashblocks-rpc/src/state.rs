@@ -684,24 +684,7 @@ where
                     if let Some(cache) = &prev_transaction_state {
                         if let Some(state) = cache.get(&transaction.tx_hash()).cloned() {
                             // Apply state to overrides since we skip execution
-                            for (addr, acc) in &state {
-                                let existing_override =
-                                    state_overrides.entry(*addr).or_insert(Default::default());
-                                existing_override.balance = Some(acc.info.balance);
-                                existing_override.nonce = Some(acc.info.nonce);
-                                existing_override.code =
-                                    acc.info.code.clone().map(|code| code.bytes());
-
-                                let existing = existing_override
-                                    .state_diff
-                                    .get_or_insert(Default::default());
-                                let changed_slots = acc.storage.iter().map(|(&key, slot)| {
-                                    (B256::from(key), B256::from(slot.present_value))
-                                });
-
-                                existing.extend(changed_slots);
-                            }
-
+                            Self::update_state_overrides(&mut state_overrides, &state);
                             pending_blocks_builder
                                 .with_transaction_state(transaction.tx_hash(), state);
                             should_execute_transaction = false;
@@ -712,22 +695,7 @@ where
                 if should_execute_transaction {
                     match evm.transact(recovered_transaction) {
                         Ok(ResultAndState { state, .. }) => {
-                            for (addr, acc) in &state {
-                                let existing_override =
-                                    state_overrides.entry(*addr).or_insert(Default::default());
-                                existing_override.balance = Some(acc.info.balance);
-                                existing_override.nonce = Some(acc.info.nonce);
-                                existing_override.code =
-                                    acc.info.code.clone().map(|code| code.bytes());
-
-                                let existing =
-                                    existing_override.state_diff.get_or_insert(Default::default());
-                                let changed_slots = acc.storage.iter().map(|(&key, slot)| {
-                                    (B256::from(key), B256::from(slot.present_value))
-                                });
-
-                                existing.extend(changed_slots);
-                            }
+                            Self::update_state_overrides(&mut state_overrides, &state);
                             pending_blocks_builder
                                 .with_transaction_state(transaction.tx_hash(), state.clone());
                             evm.db_mut().commit(state);
@@ -755,6 +723,28 @@ where
         pending_blocks_builder.with_db_cache(db.cache);
         pending_blocks_builder.with_state_overrides(state_overrides);
         Ok(Some(Arc::new(pending_blocks_builder.build()?)))
+    }
+
+    fn update_state_overrides(state_overrides: &mut StateOverride, state: &EvmState) {
+        for (addr, acc) in state {
+            if acc.is_touched() {
+                let existing_override = state_overrides.entry(*addr).or_insert(Default::default());
+                existing_override.balance = Some(acc.info.balance);
+                existing_override.nonce = Some(acc.info.nonce);
+                existing_override.code = acc.info.code.clone().map(|code| code.bytes());
+
+                let existing = existing_override
+                    .state_diff
+                    .get_or_insert(Default::default());
+                let changed_slots = acc
+                    .storage
+                    .iter()
+                    .filter(|(_, slot)| slot.is_changed())
+                    .map(|(&key, slot)| (B256::from(key), B256::from(slot.present_value)));
+
+                existing.extend(changed_slots);
+            }
+        }
     }
 
     fn is_next_flashblock(
