@@ -334,6 +334,11 @@ where
                 let waiting_flashblocks = guard.take().unwrap_or_default();
                 drop(guard);
 
+                info!(
+                    message = "processing canonical block with buffered flashblocks",
+                    block_number = op_block_number,
+                    buffered_flashblocks = waiting_flashblocks.len(),
+                );
                 self.build_pending_state(None, &waiting_flashblocks, None)
             }
         }
@@ -394,35 +399,6 @@ where
                 }
             }
             None => {
-                // Use mutex-guarded waiting buffer
-                {
-                    let mut guard = self.waiting_flashblocks.lock().unwrap();
-                    if guard.is_none() {
-                        // No buffer yet
-                        if flashblock.index == 0 {
-                            // Do not hold the lock during client IO/build
-                            drop(guard);
-                            if self
-                                .client
-                                .header_by_number(flashblock.metadata.block_number.saturating_sub(1))?
-                                .is_some()
-                            {
-                                debug!(message = "process_flashblock process new block", flashblocks = 1);
-                                return self.build_pending_state(None, &vec![flashblock], None);
-                            } else {
-                                let mut v = Vec::new();
-                                v.push(flashblock);
-                                let mut guard = self.waiting_flashblocks.lock().unwrap();
-                                *guard = Some(v);
-                                return Ok(None);
-                            }
-                        } else {
-                            info!(message = "waiting for first Flashblock");
-                            return Ok(None);
-                        }
-                    }
-                }
-
                 let mut guard = self.waiting_flashblocks.lock().unwrap();
                 if let Some(vec) = guard.as_mut() {
                     if vec.is_empty() {
@@ -438,17 +414,49 @@ where
                             == flashblock.metadata.block_number
                             && flashblock.index == 0;
                         if is_next_of_block || is_first_of_block {
+                            let flashblock_block_num = flashblock.metadata.block_number;
+
                             vec.push(flashblock);
                             // 仅仅保留两个区块的数据
                             vec.retain(|fb| fb.metadata.block_number >= last_fb.metadata.block_number - 1);
+                            info!(message = "process_flashblock buffer flashblock for canonical_block",
+                                flashblock_number = flashblock_block_num,
+                                flashblocks = vec.len());
                         } else {
                             warn!(message = "received non-sequential Flashblock, ignoring", last_fb_index = last_fb.index, new_fb_index = flashblock.index);
                             *guard = None;
-                            return Ok(None);
                         }
                     }
+                    return Ok(None);
+                } else {
+                    // No buffer yet
+                    if flashblock.index == 0 {
+                        // Do not hold the lock during client IO/build
+                        drop(guard);
+                        if self
+                            .client
+                            .header_by_number(flashblock.metadata.block_number.saturating_sub(1))?
+                            .is_some()
+                        {
+                            debug!(message = "process_flashblock process new block", flashblocks = 1);
+                            return self.build_pending_state(None, &vec![flashblock], None);
+                        } else {
+                            let flashblock_block_num = flashblock.metadata.block_number;
+                            let mut v = Vec::new();
+                            v.push(flashblock);
+                            let mut guard = self.waiting_flashblocks.lock().unwrap();
+                            *guard = Some(v);
+
+                            debug!(message = "process_flashblock buffer flashblock for canonical_block",
+                                    flashblock_number = flashblock_block_num,
+                                    flashblocks = 1);
+                            return Ok(None);
+                        }
+                    } else {
+                        info!(message = "waiting for buffer Flashblock which index is zero");
+                        return Ok(None);
+                    }
                 }
-                Ok(None)
             }
         }
     }
